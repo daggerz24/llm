@@ -1,0 +1,10 @@
+py train.py --input_file data.txt --model_name "microsoft/phi-2" --output_dir my_model --epochs 100 --batch_size 16 --learning_rate 1e-4 --save_full_model
+py train.py --input_file data.txt --output_dir ./my_finetuned --model_name "Qwen/Qwen2-0.5B-Instruct" --epochs 1 --batch_size 1 --gradient_accumulation 2 --learning_rate 1e-5 --max_length 128 --save_full_model
+py train.py --input_file data.txt --output_dir ./my_finetuned --model_name "Qwen/Qwen2-0.5B-Instruct" --epochs 50 --batch_size 1 --gradient_accumulation 6 --learning_rate 5e-5 --max_length 128 --save_full_model --generate --prompt "Агрессия останавливается только там, где сталкивается с встречной агрессией" --max_new_tokens 150
+
+pytest -q pytest.py
+py test.py
+
+py train.py --input_file data.txt --output_dir ./my_finetuned --model_name "Qwen/Qwen2-0.5B-Instruct" --epochs 20 --batch_size 2 --gradient_accumulation 2 --learning_rate 2e-5 --max_length 256 --save_full_model --generate --prompt "Агрессия останавливается только там, где сталкивается с встречной агрессией" --max_new_tokens 200
+py train.py --input_file data.txt --output_dir ./my_finetuned --model_name "Qwen/Qwen2-0.5B-Instruct" --epochs 40 --batch_size 2 --gradient_accumulation 4 --learning_rate 1e-5 --max_length 256 --save_full_model --generate --prompt "Тогда мы постоим, а вечером уйдём домой строчить в интернет!" --max_new_tokens 200
+py train.py --input_file data.txt --output_dir ./my_finetuned --model_name "Qwen/Qwen2-0.5B-Instruct" --epochs 40 --batch_size 2 --gradient_accumulation 4 --learning_rate 1e-5 --max_length 256 --repeat_factor 8 --save_full_model --generate --prompt "Тогда мы постоим, а вечером уйдём домой строчить в интернет!" --max_new_tokens 200
