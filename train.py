@@ -16,6 +16,9 @@ from transformers import (
     TrainingArguments,
 )
 
+# -------------------------------------------------
+# 1️⃣ Утилиты выбора устройства и dtype
+# -------------------------------------------------
 def get_device() -> torch.device:
     try:
         import torch_directml  # type: ignore
@@ -30,6 +33,7 @@ def get_device() -> torch.device:
     print("⚠️  No GPU found – using CPU.")
     return torch.device("cpu")
 
+
 def get_dtype(device: torch.device) -> torch.dtype:
     if device.type == "cuda":
         if torch.cuda.is_bf16_supported():
@@ -37,8 +41,13 @@ def get_dtype(device: torch.device) -> torch.dtype:
         return torch.float16
     return torch.float32
 
+
+# -------------------------------------------------
+# 2️⃣ Датасет‑генератор (чтение, chunk‑инг, токенизация)
+# -------------------------------------------------
 class TextDatasetGenerator:
-    def __init__(self, tokenizer: AutoTokenizer, max_length: int = 512, overlap: int = 200, chunk_size_chars: int = 4096):
+    def __init__(self, tokenizer: AutoTokenizer, max_length: int = 512,
+                 overlap: int = 200, chunk_size_chars: int = 4096):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.overlap = overlap
@@ -61,13 +70,13 @@ class TextDatasetGenerator:
         start = 0
         while start < len(token_ids):
             end = start + self.max_length
-            chunk_ids = token_ids[start:end]
-            yield chunk_ids
+            yield token_ids[start:end]
             start = max(end - self.overlap, 0)
 
     def prepare_dataset(self, file_path: str) -> Dataset:
         if not Path(file_path).is_file():
             raise FileNotFoundError(f"Input file not found: {file_path}")
+
         token_chunks = []
         overlap_buffer: list[int] = []
         for raw_window in self._read_in_chunks(file_path):
@@ -77,6 +86,7 @@ class TextDatasetGenerator:
             for chunk_ids in self._chunk_token_ids(new_ids):
                 token_chunks.append(chunk_ids)
             overlap_buffer = new_ids[-self.overlap :] if self.overlap > 0 else []
+
         padded = self.tokenizer.pad(
             {"input_ids": token_chunks},
             padding="max_length",
@@ -96,8 +106,13 @@ class TextDatasetGenerator:
             }
         )
 
+
+# -------------------------------------------------
+# 3️⃣ LoRA‑конфигурация
+# -------------------------------------------------
 def setup_lora(model):
     from peft import LoraConfig, get_peft_model
+
     lora_cfg = LoraConfig(
         r=16,
         lora_alpha=32,
@@ -109,8 +124,13 @@ def setup_lora(model):
     model = get_peft_model(model, lora_cfg)
     return model, lora_cfg
 
+
+# -------------------------------------------------
+# 4️⃣ Сохранение merged‑модели (base + LoRA)
+# -------------------------------------------------
 def save_full_model(model, tokenizer, output_dir: str, lora_cfg=None, lora_adapter_dir=None):
     from peft import PeftModel
+
     os.makedirs(output_dir, exist_ok=True)
     if lora_cfg is not None and lora_adapter_dir is not None:
         base = AutoModelForCausalLM.from_pretrained(
@@ -128,6 +148,10 @@ def save_full_model(model, tokenizer, output_dir: str, lora_cfg=None, lora_adapt
         tokenizer.save_pretrained(output_dir)
         print(f"✅ Model (no LoRA) saved to {output_dir}")
 
+
+# -------------------------------------------------
+# 5️⃣ Основная функция обучения
+# -------------------------------------------------
 def run_training(args):
     device = get_device()
     dtype = get_dtype(device)
@@ -147,15 +171,11 @@ def run_training(args):
     dataset = ds_gen.prepare_dataset(args.input_file)
 
     # ----------------- Повторяем датасет -----------------
-    # Позволяет получить больше градиентных шагов без добавления новых данных.
-    # По‑умолчанию повторяем 8 раз, но значение можно переопределить через CLI:
-    #   --repeat_factor N
     repeat_factor = getattr(args, "repeat_factor", 8)
     if repeat_factor > 1:
         dataset = concatenate_datasets([dataset] * repeat_factor)
-        print(f"🔁 Dataset repeated {repeat_factor} times → {len(dataset)} examples")
+        print(f"🔁 Dataset repeated {repeat_factor}× → {len(dataset)} examples")
 
-    # ----------------- Инфо о датасете -----------------
     print(f"🧩 Dataset size: {len(dataset)} examples")
     print(f"🔢 Example (ids): {dataset[0]['input_ids'][:10]} …")
 
@@ -201,12 +221,14 @@ def run_training(args):
         print(f"❌ Training failed: {exc}")
         raise
 
+    # ----------------- Сохраняем LoRA‑адаптер -----------------
     lora_dir = os.path.join(args.output_dir, "lora_adapter")
     os.makedirs(lora_dir, exist_ok=True)
     trainer.model.save_pretrained(lora_dir)
     tokenizer.save_pretrained(lora_dir)
     print(f"💾 LoRA adapter saved to {lora_dir}")
 
+    # ----------------- Сохраняем merged‑модель -----------------
     if args.save_full_model:
         full_dir = os.path.join(args.output_dir, "full_merged")
         save_full_model(trainer.model, tokenizer, full_dir, lora_cfg, lora_dir)
@@ -223,95 +245,103 @@ def run_training(args):
         }
         with open(os.path.join(full_dir, "training_meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
-
         print(f"🏁 Full merged model ready at {full_dir}")
 
-    print("\n✅ Training finished!")
+    # ----------------- Публикация в Hugging Face Hub -----------------
+    if args.push_to_hub:
+        # Токен берётся из переменной окружения HF_TOKEN (GitHub Secrets)
+        hf_token = os.getenv("HF_TOKEN")
+        if not hf_token:
+            raise RuntimeError("HF_TOKEN env variable not set – required for push_to_hub.")
+        from huggingface_hub import login, upload_folder, HfApi
 
-def generate_text(
-    model_path: str,
-    prompt: str,
-    max_new_tokens: int = 256,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-):
-    device = get_device()
-    dtype = get_dtype(device)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-    try:
-        from peft import PeftModel
-        base = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
+        # 1) Авторизуемся
+        login(token=hf_token)
+
+        # 2) Формируем имя репозитория: <hf_username>/<hf_repo_name>
+        repo_id = f"{args.hf_username}/{args.hf_repo_name}"
+        api = HfApi()
+        # Если репозиторий уже существует – просто пушим, иначе создаём
+        try:
+            api.repo_info(repo_id=repo_id)
+        except Exception:
+            api.create_repo(repo_id=repo_id, private=False, exist_ok=True)
+
+        # 3) Пушим содержимое merged‑модели
+        upload_folder(
+            repo_id=repo_id,
+            folder_path=full_dir,
+            token=hf_token,
+            commit_message=f"CI build – epochs={args.epochs}",
         )
-        model = PeftModel.from_pretrained(base, model_path)
-        print("🔌 Loaded LoRA adapter.")
-    except Exception:
+        print(f"🚀 Model pushed to Hugging Face Hub → https://huggingface.co/{repo_id}")
+
+    # ----------------- Демонстрация генерации (по желанию) -----------------
+    if args.generate:
+        model_path = full_dir if args.save_full_model else lora_dir
+        from transformers import AutoModelForCausalLM
+
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
         )
-        print("⚙️ Loaded plain model (no LoRA).")
-    model.to(device)
-    model.eval()
-    inputs = tokenizer(prompt, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    with torch.no_grad():
-        generated = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-    return tokenizer.decode(generated[0], skip_special_tokens=True)
+        model.to(device).eval()
+        inputs = tokenizer(args.prompt, return_tensors="pt").to(device)
 
+        with torch.no_grad():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=args.max_new_tokens,
+                temperature=0.4,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        print("\n=== GENERATED TEXT ===")
+        print(tokenizer.decode(out[0], skip_special_tokens=True))
+        print("======================")
+
+    print("\n✅ Training finished!")
+
+
+# -------------------------------------------------
+# 6️⃣ CLI
+# -------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
         description="Fine‑tune a causal LLM on a single Russian text file (AMD DirectML / CUDA / CPU)."
     )
     parser.add_argument("--input_file", type=str, required=True, help="Path to the plain‑text file.")
     parser.add_argument("--output_dir", type=str, default="./fine_tuned_model", help="Output directory.")
-    parser.add_argument("--model_name", type=str, default="microsoft/Phi-3-mini-4k-instruct", help="HF model identifier.")
-    parser.add_argument("--epochs", type=int, default=2, help="Number of training epochs.")
-    parser.add_argument("--batch_size", type=int, default=1, help="Per‑device training batch size.")
-    parser.add_argument("--gradient_accumulation", type=int, default=2, help="Gradient accumulation steps.")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-0.5B-Instruct", help="HF model identifier.")
+    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
+    parser.add_argument("--batch_size", type=int, default=2, help="Per‑device training batch size.")
+    parser.add_argument("--gradient_accumulation", type=int, default=4, help="Gradient accumulation steps.")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate.")
     parser.add_argument("--max_length", type=int, default=256, help="Maximum token length per chunk.")
-    parser.add_argument("--save_full_model", action="store_true", help="Save merged model.")
+    parser.add_argument("--repeat_factor", type=int, default=8,
+                        help="How many times to repeat the whole dataset (more steps).")
+    parser.add_argument("--save_full_model", action="store_true", help="Save merged (base+LoRA) model.")
     parser.add_argument("--generate", action="store_true", help="Run generation demo after training.")
-    parser.add_argument("--prompt", type=str, default="Агрессия останавливается только там, где сталкивается с встречной агрессией", help="Prompt for generation.")
-    parser.add_argument("--max_new_tokens", type=int, default=256, help="Number of tokens to generate.")
-    parser.add_argument(
-        "--repeat_factor",
-        type=int,
-        default=8,
-        help="How many times to repeat the whole dataset (to get more training steps).",
-    )
+    parser.add_argument("--prompt", type=str,
+                        default="Тогда мы постоим, а вечером уйдём домой строчить в интернет!",
+                        help="Prompt for generation demo.")
+    parser.add_argument("--max_new_tokens", type=int, default=200, help="Number of tokens to generate.")
+    # ---------- HF‑Hub параметры ----------
+    parser.add_argument("--push_to_hub", action="store_true",
+                        help="Push the merged model to Hugging Face Hub.")
+    parser.add_argument("--hf_username", type=str, default="", help="Your HF username (required if --push_to_hub).")
+    parser.add_argument("--hf_repo_name", type=str, default="qwen2-finetuned",
+                        help="Repo name on HF Hub (will be created if missing).")
     args = parser.parse_args()
+
+    # Если пользователь запросил push, проверяем, что передал имя пользователя
+    if args.push_to_hub and not args.hf_username:
+        raise ValueError("When using --push_to_hub you must also provide --hf_username")
 
     run_training(args)
 
-    if args.generate:
-        if args.save_full_model:
-            model_path = os.path.join(args.output_dir, "full_merged")
-        else:
-            model_path = os.path.join(args.output_dir, "lora_adapter")
-        print("\n🧪 Running generation demo …")
-        try:
-            out = generate_text(
-                model_path=model_path,
-                prompt=args.prompt,
-                max_new_tokens=args.max_new_tokens,
-            )
-            print("\n=== GENERATED TEXT ===")
-            print(out)
-            print("======================")
-        except Exception as e:
-            print(f"❌ Generation failed: {e}")
 
 if __name__ == "__main__":
     main()
