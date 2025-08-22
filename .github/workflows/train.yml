@@ -8,9 +8,6 @@ on:
 jobs:
   train:
     runs-on: ubuntu-latest
-    resources:
-      limits:
-        gpu: 1               # бесплатный T4‑GPU
 
     steps:
       - name: Checkout repository
