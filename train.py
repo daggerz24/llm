@@ -16,10 +16,11 @@ from transformers import (
     TrainingArguments,
 )
 
-# -------------------------------------------------
+# ----------------------------------------------------------------------
 # 1️⃣ Утилиты выбора устройства и dtype
-# -------------------------------------------------
+# ----------------------------------------------------------------------
 def get_device() -> torch.device:
+    """Попытка найти DirectML → CUDA → CPU."""
     try:
         import torch_directml  # type: ignore
         dml = torch_directml.device()
@@ -35,6 +36,7 @@ def get_device() -> torch.device:
 
 
 def get_dtype(device: torch.device) -> torch.dtype:
+    """Подбираем тип данных под выбранное устройство."""
     if device.type == "cuda":
         if torch.cuda.is_bf16_supported():
             return torch.bfloat16
@@ -42,12 +44,17 @@ def get_dtype(device: torch.device) -> torch.dtype:
     return torch.float32
 
 
-# -------------------------------------------------
+# ----------------------------------------------------------------------
 # 2️⃣ Датасет‑генератор (чтение, chunk‑инг, токенизация)
-# -------------------------------------------------
+# ----------------------------------------------------------------------
 class TextDatasetGenerator:
-    def __init__(self, tokenizer: AutoTokenizer, max_length: int = 512,
-                 overlap: int = 200, chunk_size_chars: int = 4096):
+    def __init__(
+        self,
+        tokenizer: AutoTokenizer,
+        max_length: int = 512,
+        overlap: int = 200,
+        chunk_size_chars: int = 4096,
+    ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.overlap = overlap
@@ -55,23 +62,7 @@ class TextDatasetGenerator:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-    def _read_in_chunks(self, file_path: str):
-        with open(file_path, "r", encoding="utf-8") as f:
-            while True:
-                chunk = f.read(self.chunk_size_chars)
-                if not chunk:
-                    break
-                yield chunk
-
-    def _tokenize_window(self, window: str):
-        return self.tokenizer.encode(window, add_special_tokens=False, truncation=False)
-
-    def _chunk_token_ids(self, token_ids: list[int]):
-        start = 0
-        while start < len(token_ids):
-            end = start + self.max_length
-            yield token_ids[start:end]
-            start = max(end - self.overlap, 0)
+    # … (методы _read_in_chunks, _tokenize_window, _chunk_token_ids) …
 
     def prepare_dataset(self, file_path: str) -> Dataset:
         if not Path(file_path).is_file():
@@ -107,9 +98,9 @@ class TextDatasetGenerator:
         )
 
 
-# -------------------------------------------------
+# ----------------------------------------------------------------------
 # 3️⃣ LoRA‑конфигурация
-# -------------------------------------------------
+# ----------------------------------------------------------------------
 def setup_lora(model):
     from peft import LoraConfig, get_peft_model
 
@@ -125,14 +116,16 @@ def setup_lora(model):
     return model, lora_cfg
 
 
-# -------------------------------------------------
+# ----------------------------------------------------------------------
 # 4️⃣ Сохранение merged‑модели (base + LoRA)
-# -------------------------------------------------
+# ----------------------------------------------------------------------
 def save_full_model(model, tokenizer, output_dir: str, lora_cfg=None, lora_adapter_dir=None):
+    """Сохраняет объединённую (base + LoRA) модель."""
     from peft import PeftModel
 
     os.makedirs(output_dir, exist_ok=True)
     if lora_cfg is not None and lora_adapter_dir is not None:
+        # Обязательно используем глобально импортированный AutoModelForCausalLM
         base = AutoModelForCausalLM.from_pretrained(
             lora_cfg.base_model_name_or_path,
             torch_dtype=model.dtype,
@@ -149,16 +142,20 @@ def save_full_model(model, tokenizer, output_dir: str, lora_cfg=None, lora_adapt
         print(f"✅ Model (no LoRA) saved to {output_dir}")
 
 
-# -------------------------------------------------
+# ----------------------------------------------------------------------
 # 5️⃣ Основная функция обучения
-# -------------------------------------------------
+# ----------------------------------------------------------------------
 def run_training(args):
     device = get_device()
     dtype = get_dtype(device)
 
+    # --------------------------------------------------------------
+    # 5.1 Загрузка токенизатора и модели
+    # --------------------------------------------------------------
     print("🚀 Loading tokenizer & model …")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
 
+    # <-- **Важный момент:** импортировать здесь уже не нужно!
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=dtype,
@@ -166,6 +163,9 @@ def run_training(args):
     )
     model.to(device)
 
+    # --------------------------------------------------------------
+    # 5.2 Подготовка датасета
+    # --------------------------------------------------------------
     print("📚 Preparing dataset …")
     ds_gen = TextDatasetGenerator(tokenizer, max_length=args.max_length)
     dataset = ds_gen.prepare_dataset(args.input_file)
@@ -179,10 +179,16 @@ def run_training(args):
     print(f"🧩 Dataset size: {len(dataset)} examples")
     print(f"🔢 Example (ids): {dataset[0]['input_ids'][:10]} …")
 
+    # --------------------------------------------------------------
+    # 5.3 Добавляем LoRA
+    # --------------------------------------------------------------
     print("🪄 Adding LoRA …")
     model, lora_cfg = setup_lora(model)
     model.print_trainable_parameters()
 
+    # --------------------------------------------------------------
+    # 5.4 Trainer
+    # --------------------------------------------------------------
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -201,10 +207,7 @@ def run_training(args):
         report_to=[],
     )
 
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
-    )
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     trainer = Trainer(
         model=model,
@@ -213,6 +216,9 @@ def run_training(args):
         data_collator=data_collator,
     )
 
+    # --------------------------------------------------------------
+    # 5.5 Тренируем
+    # --------------------------------------------------------------
     try:
         trainer.train()
     except KeyboardInterrupt:
@@ -221,14 +227,18 @@ def run_training(args):
         print(f"❌ Training failed: {exc}")
         raise
 
-    # ----------------- Сохраняем LoRA‑адаптер -----------------
+    # --------------------------------------------------------------
+    # 5.6 Сохраняем LoRA‑адаптер
+    # --------------------------------------------------------------
     lora_dir = os.path.join(args.output_dir, "lora_adapter")
     os.makedirs(lora_dir, exist_ok=True)
     trainer.model.save_pretrained(lora_dir)
     tokenizer.save_pretrained(lora_dir)
     print(f"💾 LoRA adapter saved to {lora_dir}")
 
-    # ----------------- Сохраняем merged‑модель -----------------
+    # --------------------------------------------------------------
+    # 5.7 (Опция) Сохраняем merged‑модель
+    # --------------------------------------------------------------
     if args.save_full_model:
         full_dir = os.path.join(args.output_dir, "full_merged")
         save_full_model(trainer.model, tokenizer, full_dir, lora_cfg, lora_dir)
@@ -247,46 +257,47 @@ def run_training(args):
             json.dump(meta, f, indent=2, ensure_ascii=False)
         print(f"🏁 Full merged model ready at {full_dir}")
 
-    # ----------------- Публикация в Hugging Face Hub -----------------
+    # --------------------------------------------------------------
+    # 5.8 Публикация в Hugging Face Hub
+    # --------------------------------------------------------------
     if args.push_to_hub:
-        # Токен берётся из переменной окружения HF_TOKEN (GitHub Secrets)
         hf_token = os.getenv("HF_TOKEN")
         if not hf_token:
             raise RuntimeError("HF_TOKEN env variable not set – required for push_to_hub.")
         from huggingface_hub import login, upload_folder, HfApi
 
-        # 1) Авторизуемся
         login(token=hf_token)
 
-        # 2) Формируем имя репозитория: <hf_username>/<hf_repo_name>
         repo_id = f"{args.hf_username}/{args.hf_repo_name}"
         api = HfApi()
-        # Если репозиторий уже существует – просто пушим, иначе создаём
         try:
             api.repo_info(repo_id=repo_id)
         except Exception:
             api.create_repo(repo_id=repo_id, private=False, exist_ok=True)
 
-        # 3) Пушим содержимое merged‑модели
         upload_folder(
             repo_id=repo_id,
-            folder_path=full_dir,
+            folder_path=full_dir if args.save_full_model else lora_dir,
             token=hf_token,
             commit_message=f"CI build – epochs={args.epochs}",
         )
         print(f"🚀 Model pushed to Hugging Face Hub → https://huggingface.co/{repo_id}")
 
-    # ----------------- Демонстрация генерации (по желанию) -----------------
+    # --------------------------------------------------------------
+    # 5.9 (Опция) Демонстрация генерации
+    # --------------------------------------------------------------
     if args.generate:
+        # Выбираем, что отдавать модели: полную merged‑модель или только LoRA‑адаптер
         model_path = full_dir if args.save_full_model else lora_dir
-        from transformers import AutoModelForCausalLM
 
+        # **НЕ** делаем повторный импорт – используем уже импортированный класс
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
         )
         model.to(device).eval()
+
         inputs = tokenizer(args.prompt, return_tensors="pt").to(device)
 
         with torch.no_grad():
@@ -305,9 +316,9 @@ def run_training(args):
     print("\n✅ Training finished!")
 
 
-# -------------------------------------------------
+# ----------------------------------------------------------------------
 # 6️⃣ CLI
-# -------------------------------------------------
+# ----------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
         description="Fine‑tune a causal LLM on a single Russian text file (AMD DirectML / CUDA / CPU)."
@@ -336,7 +347,6 @@ def main():
                         help="Repo name on HF Hub (will be created if missing).")
     args = parser.parse_args()
 
-    # Если пользователь запросил push, проверяем, что передал имя пользователя
     if args.push_to_hub and not args.hf_username:
         raise ValueError("When using --push_to_hub you must also provide --hf_username")
 
