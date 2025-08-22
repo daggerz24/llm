@@ -1,4 +1,3 @@
-# .github/workflows/train.yml
 name: Train & Deploy Qwen2 LoRA
 
 on:
